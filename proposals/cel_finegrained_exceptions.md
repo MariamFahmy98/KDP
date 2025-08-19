@@ -103,7 +103,6 @@ spec:
         )
 ```
 
-
 2. **Filtering the Containers**:
 
     This method uses a variable to create a pre-filtered list of items that the validation rule should apply to. The logic is: "Create a list of containers that are **NOT** on the exclusion list, and then validate that every container in this new list is compliant."
@@ -314,6 +313,118 @@ validations:
         container.securityContext.seccompProfile.type == 'RuntimeDefault' ||
         container.securityContext.seccompProfile.type == 'Localhost'
       )
+```
+
+## The Generation of ValidatingAdmissionPolicy
+
+In case of generating a ValidatingAdmissionPolicy from a ValidatingPolicy, we can include the `exceptions.allowedImages` and `exceptions.allowedValues` in the `variables` field. This ensures that the generated ValidatingAdmissionPolicy has access to the exception data during admission control.
+
+## Limitation
+
+The challenge is that we don’t want users to modify their policies to explicitly use the new variables exceptions.allowedImages and exceptions.allowedValues.
+
+There are two possible approaches to handle this:
+
+1. Handle exceptions internally (without exposing variables to users):
+
+For `exceptions.allowedImages`, we could evaluate the pod against the exception list and remove any containers that match. For example, if a pod has two containers; `busybox` and `nginx`. And `nginx` is listed in `exceptions.allowedImages`, then we remove the `nginx` container and only evaluate the remaining containers against the policy.
+
+However, this approach has several drawbacks:
+
+- **Skipping specific conditions:** If we want to skip only one condition for a specific image rather than all conditions, the current approach won’t suffice. For example:
+
+  ```yaml
+  validations:
+    - expression: >
+        object.spec.containers.all(container,
+          !has(container.securityContext) ||
+          (has(container.securityContext.allowPrivilegeEscalation) &&
+            container.securityContext.allowPrivilegeEscalation == false) &&
+          (has(container.securityContext.runAsNonRoot) && 
+            container.securityContext.runAsNonRoot == true)
+        )
+  ```
+
+In this case, exempting `nginx` would cause it to skip all checks, but what if the requirement is to skip only the `allowPrivilegeEscalation` check and still enforce `runAsNonRoot`?
+
+- **Multiple validation expressions:** The same issue arises when multiple validations exist:
+
+  ```yaml
+  validations:
+    - expression: >
+        object.spec.containers.all(container,
+          !has(container.securityContext) ||
+          (has(container.securityContext.allowPrivilegeEscalation) &&
+            container.securityContext.allowPrivilegeEscalation == false))
+    - expression: >
+        object.spec.containers.all(container,
+          !has(container.securityContext) ||
+          (has(container.securityContext.runAsNonRoot) && 
+            container.securityContext.runAsNonRoot == true))
+  ```
+
+Exempting a container based on `exceptions.allowedImages` would skip it in all validations, which may not be the intended behavior.
+
+- **Scope of allowedImages:** Another consideration is whether `exceptions.allowedImages` should apply only to standard containers, or also to init containers, and ephemeral containers.
+
+Additionally, for `exceptions.allowedValues`, it’s not straightforward to evaluate them against the resource without referencing the policy context itself.
+
+2. Auto-generate CEL expressions with exception variables:
+
+Another option is to auto-generate CEL expressions that incorporate `exceptions.allowedImages` and `exceptions.allowedValues`. But CEL doesn’t follow a fixed pattern, so this could easily result in invalid or hard-to-maintain expressions.
+
+As a result, we can re-design the exception to be as follows:
+
+```yaml
+apiVersion: policies.kyverno.io/v1alpha1
+kind: PolicyException
+metadata:
+  name: allow-unconfined-for-nginx
+spec:
+  policyRefs:
+    - name: enforce-seccomp-profile
+      kind: ValidatingPolicy
+  # Optional scope for the exception (defaults to all containers)
+  scope:
+    containers: true            # apply to spec.containers
+    initContainers: true        # apply to spec.initContainers
+    ephemeralContainers: false  # apply to ephemeralContainers
+  # Images to be excluded from policy evaluation
+  allowedImages:
+    - nginx
+    - busybox
+  # Values to be excludes from policy evaluation
+  allowedValues:
+    securityContext:
+      seccompProfileType:
+        - Unconfined
+```
+
+But how can we generate a ValidatingAdmissionPolicy from a ValidatingPolicy that uses the new exception design?
+
+## Reporting Control
+
+In many environments (e.g., OpenShift, GKE), ValidatingAdmissionPolicies (VAPs) are shipped and managed by the platform itself. Clusters may have dozens or even hundreds of VAPs deployed. By default, Kyverno (or the reporting controller) generates PolicyReports for all VAPs. Since there is no field to control reporting in the VAP, so we need to do it via PolicyException.
+
+As a solution, the PolicyException will not only be used as a way to filter resource evaluation but also as a reporting directive. That means:
+1. Policy evaluation still happens normally.
+2. But whether or how results get reported is determined by the exception.
+
+```yaml
+apiVersion: policies.kyverno.io/v1alpha1
+kind: PolicyException
+metadata:
+  name: disable-seccomp-reporting
+spec:
+  # It will work for all policies, not just the VAP.
+  policyRefs:
+    - name: enforce-seccomp-profile
+      kind: ValidatingAdmissionPolicy
+
+  # New field for reporting control
+  reporting:
+    enabled: false  # Disable reporting for this policy
+    mode: skip      # if result is "fail", we generate a report with a "skip" result or maybe "warn" result?
 ```
 
 # Implementation
